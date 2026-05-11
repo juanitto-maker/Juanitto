@@ -1,0 +1,133 @@
+name: KeePass Backup Reminder
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send backup reminder notifications
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          import json
+          import smtplib
+          import ssl
+          from datetime import datetime, timezone
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          import urllib.request
+          import urllib.error
+
+          OWNER = "juanitto-maker"
+          REPO = "Juanitto"
+          REPO_URL = f"https://github.com/{OWNER}/{REPO}"
+          OVERDUE_DAYS = 10
+
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          GMAIL_USER = os.environ["GMAIL_USER"]
+          GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+          TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+          def gh_api(path):
+              url = f"https://api.github.com{path}"
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {GH_TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode())
+
+          def get_last_kdbx_commit_date():
+              data = gh_api(f"/repos/{OWNER}/{REPO}/commits?path=*.kdbx&per_page=1")
+              if not data:
+                  # Try searching without path filter as fallback
+                  data = gh_api(f"/repos/{OWNER}/{REPO}/commits?per_page=100")
+                  for commit in data:
+                      sha = commit["sha"]
+                      detail = gh_api(f"/repos/{OWNER}/{REPO}/commits/{sha}")
+                      files = detail.get("files", [])
+                      if any(f["filename"].endswith(".kdbx") for f in files):
+                          return commit["commit"]["committer"]["date"]
+                  return None
+              return data[0]["commit"]["committer"]["date"]
+
+          def build_message(last_date_str, days_ago, overdue):
+              warning = "⚠️ OVERDUE — " if overdue else ""
+              return {
+                  "plain": (
+                      f"{warning}KeePass Backup Reminder\n\n"
+                      f"Last backup: {last_date_str}\n"
+                      f"Days since last backup: {days_ago}\n"
+                      + (f"⚠️  More than {OVERDUE_DAYS} days since last backup!\n" if overdue else "")
+                      + f"\nRepo: {REPO_URL}"
+                  ),
+                  "html": (
+                      f"<b>{'⚠️ OVERDUE — ' if overdue else ''}KeePass Backup Reminder</b>\n\n"
+                      f"📅 <b>Last backup:</b> {last_date_str}\n"
+                      f"🕐 <b>Days since last backup:</b> {days_ago}\n"
+                      + (f"⚠️  <b>More than {OVERDUE_DAYS} days since last backup!</b>\n" if overdue else "")
+                      + f"\n🔗 <a href=\"{REPO_URL}\">Open repo</a>"
+                  ),
+              }
+
+          def send_telegram(text_html):
+              url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+              payload = json.dumps({
+                  "chat_id": TELEGRAM_CHAT_ID,
+                  "text": text_html,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": False,
+              }).encode()
+              req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req) as resp:
+                  result = json.loads(resp.read().decode())
+              if not result.get("ok"):
+                  print(f"Telegram error: {result}", file=sys.stderr)
+                  sys.exit(1)
+              print("Telegram notification sent.")
+
+          def send_email(subject, body_plain):
+              msg = MIMEMultipart("alternative")
+              msg["Subject"] = subject
+              msg["From"] = GMAIL_USER
+              msg["To"] = GMAIL_USER
+              msg.attach(MIMEText(body_plain, "plain"))
+              ctx = ssl.create_default_context()
+              with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+                  server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                  server.sendmail(GMAIL_USER, GMAIL_USER, msg.as_string())
+              print("Email notification sent.")
+
+          last_date_str = get_last_kdbx_commit_date()
+          if last_date_str is None:
+              print("No .kdbx commits found in repo.")
+              last_date_str = "never"
+              days_ago = "unknown"
+              overdue = True
+          else:
+              last_dt = datetime.fromisoformat(last_date_str.replace("Z", "+00:00"))
+              now = datetime.now(timezone.utc)
+              days_ago = (now - last_dt).days
+              overdue = days_ago > OVERDUE_DAYS
+              last_date_str = last_dt.strftime("%Y-%m-%d %H:%M UTC")
+
+          msg = build_message(last_date_str, days_ago, overdue)
+          subject = f"{'[OVERDUE] ' if overdue else ''}KeePass Backup Reminder — last backup {last_date_str}"
+
+          send_telegram(msg["html"])
+          send_email(subject, msg["plain"])
+          EOF
